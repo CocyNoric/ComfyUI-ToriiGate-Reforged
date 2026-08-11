@@ -1,4 +1,4 @@
-# ComfyUI ToriiGate Reforged
+# ComfyUI-ToriiGate-Reforged
 
 [中文说明](README_zh.md)
 
@@ -69,6 +69,10 @@ Builds ToriiGate prompts and optional tags/character information.
 #### Caption types
 
 `caption_type` controls the output format and detail level:
+
+> **Tip:** The `long` mode is recommended for general use.
+
+> **Warning:** Testing found that character identification accuracy may not always be ideal, with either the quantized or original weights.
 
 | Mode | Output |
 | --- | --- |

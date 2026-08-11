@@ -1,4 +1,4 @@
-# ComfyUI ToriiGate Reforged
+# ComfyUI-ToriiGate-Reforged
 
 [English](README.md)
 
@@ -69,6 +69,10 @@ ToriiGate Caption.caption ─────> 预览任意 / Preview Any.source
 #### Caption 类型
 
 `caption_type` 用来控制输出格式和详细程度：
+
+> **提示：** 推荐在一般场景下使用 `long` 模式。
+
+> **注意：** 测试过程中发现，角色识别准确率有时可能不够理想，量化权重和原始权重均存在这一情况。
 
 | 模式 | 输出内容 |
 | --- | --- |

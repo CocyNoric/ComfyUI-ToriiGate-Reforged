@@ -1,85 +1,81 @@
-# comfyui_toriigate
+# ComfyUI ToriiGate Reforged
 
-ComfyUI custom nodes for [Minthy/ToriiGate-0.5](https://huggingface.co/Minthy/ToriiGate-0.5), an image captioning model for anime-style and digital art.
+ToriiGate nodes for ComfyUI. The plugin owns only ToriiGate prompt formatting,
+vision captioning and text generation. Model loading, quantisation, device
+placement and VRAM offload remain entirely under ComfyUI.
 
-Original Model: [Minthy/ToriiGate-0.5](https://huggingface.co/Minthy/ToriiGate-0.5)
-GGUF Models: [DraconicDragon/ToriiGate-0.5-GGUF](https://huggingface.co/DraconicDragon/ToriiGate-0.5-GGUF)
+## Important: breaking migration
 
----
+This release is a breaking replacement for the earlier loader workflows.
+Existing legacy node graphs are not compatible. Remove the old nodes and
+reconnect a native ComfyUI loader.
 
-## Installation
+All registered node IDs use the `ToriiGate_Reforged_` prefix so this package
+can coexist with an older ToriiGate installation without registry collisions.
 
-Clone this repository into your `ComfyUI/custom_nodes` folder:
+## Local workflow
 
-```bash
-cd ComfyUI/custom_nodes
-git clone https://github.com/litch230/comfyui_toriigate.git
-```
+1. Prepare a ToriiGate-compatible INT8ConvRot or BF16 model yourself. A
+   compatible GGUF is also fine when the installed native loader supports it.
+2. Prepare the matching vision/mmproj projector.
+3. Load both with the ComfyUI-native loader(s) for your installation.
+4. Connect the resulting `CLIP`/model and `CLIP_VISION`/vision outputs to
+   `ToriiGate Reforged Caption`, or connect only the model to
+   `ToriiGate Reforged Text Generate`.
+5. Connect `ToriiGate Reforged Grounding Builder` to the Caption `prompt` input
+   when grounding tags, character names, tags or descriptions are needed.
 
-If you plan to use the local Transformers node instead of the API, install the requirements:
+No external server, network endpoint, repository ID, automatic download or
+additional model package is required. The loader decides whether the weights
+run as INT8ConvRot, BF16 or GGUF and ComfyUI decides when to keep or offload
+them. The same model may safely feed Caption and Text Generate in one workflow.
 
-```bash
-# Standard Python / venv
-pip install -r ComfyUI/custom_nodes/comfyui_toriigate/requirements.txt
+## Nodes
 
-# ComfyUI Portable (Windows)
-python_embeded\python.exe -m pip install -r ComfyUI\custom_nodes\comfyui_toriigate\requirements.txt
-```
+### ToriiGate Reforged Grounding Builder
 
----
+Builds the ToriiGate prompt template while preserving the existing Caption
+type, character names, general tags, per-character tags and descriptions. It
+does not load or inspect a model.
 
-## Usage Methods
+### ToriiGate Reforged Caption
 
-This node pack provides two different ways to run ToriiGate. 
+Inputs are an `IMAGE`, a native `CLIP`/model, a compatible vision/mmproj, an
+optional prompt, pixel budget, generation length, temperature, top-p, top-k,
+decoding mode and seed. The node performs image preprocessing, vision
+projection, image-token insertion, ToriiGate chat templating and generation,
+then returns a `STRING` caption.
 
-### 1. Llama.cpp API (Recommended)
-Connects to an external `llama-server.exe` running a GGUF version of the model.
-- **Node**: `ToriiGate Llama.cpp Vision Generate`
-- **Model format**: `.gguf` only
-- **Pros**: Much faster inference, lower VRAM usage, bypasses python dependency issues.
-- **Cons**: You need to run the llama-server manually before starting ComfyUI.
+The node does not check model names, metadata, hashes or weight formats. If an
+incompatible model is connected, ComfyUI reports the model/adapter error; the
+tooltip and error identify that a ToriiGate-compatible model and mmproj are
+required.
 
-### 2. Transformers / PyTorch (Local)
-Runs the model natively inside ComfyUI using the `transformers` library.
-- **Node**: `ToriiGate Captioner`
-- **Model format**: Original unquantized HuggingFace model format (cannot run GGUF).
-- **Pros**: No external server needed.
-- **Cons**: Slower, uses more VRAM.
+`greedy_fast` is deterministic. `sample` uses temperature/top-p/top-k and the
+seed. Seed defaults to **42** and is fixed; seed `0` is a normal deterministic
+seed value rather than a special random sentinel. ComfyUI automatic progress
+feedback is used when its progress hook is available; there is no user
+progress toggle.
 
----
+### ToriiGate Reforged Text Generate
 
-## Running the Llama.cpp Server
+Text-only generation using the exact same tokenizer, sampler and KV-cache loop
+as Caption. Inputs are the native model, `system_prompt`, `prompt`, generation
+controls and `template_mode` (`toriigate` or `raw`). ToriiGate is primarily an
+image-captioning model, so general chat quality is not guaranteed.
 
-For the best performance on NVIDIA GPUs, follow these steps to run the API server:
+## Memory and execution
 
-1. Download the latest release from the [llama.cpp releases page](https://github.com/ggerganov/llama.cpp/releases). 
-   - Choose the `win-cuda` zip matching your CUDA version (e.g. `llama-b4109-bin-win-cuda-12.4-x64.zip`).
-   - If you have an AMD GPU, use `win-vulkan` or `win-rocm`.
+The nodes never call `.to("cuda")`, move a model to CPU, empty CUDA caches,
+download weights, or retain a private model cache. They release local
+generation/KV-cache references after each execution and leave residency and
+offload decisions to ComfyUI's ModelPatcher. This lets a single loaded model
+be reused by Caption, Text Generate and downstream diffusion nodes.
 
-2. Download the `cudart` zip file from the same release page (e.g. `cudart-llama-bin-win-cuda-12.4-x64.zip`). 
-   - Extract the `cudart` files directly into the same folder where you extracted `llama-server.exe`. Without this, inference on NVIDIA GPUs will be very slow.
+## Validation checklist
 
-3. Open CMD in that folder and run the server with the following optimizations. *(Note: The `-m` and `--mmproj` flags are optional if you want to preload local files; if omitted, the ComfyUI node will automatically instruct the server to download and load the correct GGUF model)*:
-
-```cmd
-llama-server.exe [-m <model.gguf>] [--mmproj <mmproj.gguf>] -b 2048 -ub 1024 -fa on -fit on -fitt 1024 -ngl 999
-```
-
-Command breakdown:
-- `-m`: (Optional) Path to your downloaded `.gguf` language model.
-- `--mmproj`: (Optional) Path to your downloaded `.gguf` vision projector model (required if preloading a vision model locally).
-- `-b 2048 -ub 1024`: Batch sizes.
-- `-fa on`: Enables Flash Attention.
-- `-fit on -fitt 1024`: Speeds up image processing.
-- `-ngl 999`: Offloads all layers to the GPU.
-
-Once the server is running on `http://127.0.0.1:8080`, you can generate captions using the `ToriiGate Llama.cpp Vision Generate` node in ComfyUI.
-
----
-
-## Node Reference
-
-- **ToriiGate Grounding Builder**: Compiles tags, characters, and descriptions into the final prompt string needed by the generator nodes.
-- **ToriiGate Captioner**: Local PyTorch generator. Takes the image and the prompt string.
-- **ToriiGate Llama.cpp Vision Generate**: API generator. Connects to `llama-server` and passes the image and prompt string.
-- **ToriiGate Llama.cpp Text Generate**: Text-only node for chatting with the model.
+The intended workflow should be checked with INT8ConvRot and BF16 image
+captioning, text-only generation, one model connected to both nodes, a Caption
+followed by diffusion (to exercise ComfyUI offload), repeated executions,
+missing-mmproj errors, fixed-seed sampling and long generations that release
+their KV cache on completion.

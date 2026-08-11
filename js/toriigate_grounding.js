@@ -3,7 +3,7 @@ import { app } from "../../scripts/app.js";
 app.registerExtension({
     name: "ComfyUI.ToriiGate.GroundingBuilder",
     async beforeRegisterNodeDef(nodeType, nodeData, app) {
-        if (nodeData.name === "ToriiGate_GroundingBuilder") {
+        if (nodeData.name === "ToriiGate_Reforged_GroundingBuilder") {
             const onNodeCreated = nodeType.prototype.onNodeCreated;
             nodeType.prototype.onNodeCreated = function() {
                 if (onNodeCreated) {

@@ -1,5 +1,3 @@
-import random
-
 prompts_b = {
 "long_thoughts_v2": """Your answer must contain 6 parts:
 <format>
@@ -147,8 +145,10 @@ prompts_names_only = {
 
 
 def make_user_query(item, c_type, use_names, add_tags, add_characters, add_char_tags, add_description, underscores_replace = False):
-    tags = item.get('tags', [])
-    random.shuffle(tags)
+    # Keep prompt construction stable.  Sampling randomness belongs to the
+    # shared generation seed; shuffling grounding tags here would make a
+    # fixed ComfyUI seed produce different input prompts between runs.
+    tags = list(item.get('tags', []))
     if underscores_replace:
         tags = [a.replace('_', ' ') if len(a)>3 else a for a in tags]
         tags_string = ', '.join(tags)

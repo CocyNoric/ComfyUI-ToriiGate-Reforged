@@ -1,88 +1,94 @@
 # ComfyUI ToriiGate Reforged
 
-ToriiGate nodes for ComfyUI. The plugin owns only ToriiGate prompt formatting,
-image captioning and text generation. Model loading, quantisation, device
-placement and VRAM offload remain entirely under ComfyUI.
+[中文说明](README_zh.md)
 
-## Important: breaking migration
+This is a Reforged version of [litch230/comfyui_toriigate](https://github.com/litch230/comfyui_toriigate). It removes the bundled Transformers loader and llama.cpp API nodes, and uses ComfyUI's native CLIP/Qwen3.5 loading, image understanding and generation instead.
 
-This release is a breaking replacement for the earlier loader workflows.
-Existing legacy node graphs are not compatible. Remove the old nodes and
-reconnect a native ComfyUI loader.
+## Changes
 
-All registered node IDs use the `ToriiGate_*_Reforged` suffix so this package
-can coexist with an older ToriiGate installation without registry collisions.
+- Removed the custom model loader, automatic download and llama.cpp backend.
+- Uses ComfyUI's native `Load CLIP` node and model/offload management.
+- Uses the visual encoder included in the ToriiGate/Qwen3.5 CLIP model; no separate vision input is required.
+- Keeps the original ToriiGate prompt formats, disables thinking before generation, and aligns the original image-size and visual-normalization behavior.
 
-## Local workflow
+Old workflows must replace the legacy ToriiGate nodes with the Reforged nodes.
 
-1. Prepare a ToriiGate-compatible INT8ConvRot or BF16 model yourself. A
-   compatible GGUF is also fine when the installed native loader supports it.
-2. Load it with the ComfyUI-native CLIP loader for your installation.
-3. Connect the resulting `CLIP`/model output to
-   `ToriiGate Caption Reforged`, or to
-   `ToriiGate Text Generate Reforged`.
-4. Connect `ToriiGate Grounding Builder Reforged` to the Caption `prompt` input
-   when grounding tags, character names, tags or descriptions are needed.
+## Installation
 
-No external server, network endpoint, repository ID, automatic download or
-additional model package is required. The loader decides whether the weights
-run as INT8ConvRot, BF16 or GGUF and ComfyUI decides when to keep or offload
-them. The same model may safely feed Caption and Text Generate in one workflow.
+Clone this repository into `ComfyUI/custom_nodes/`, then restart ComfyUI:
+
+```bash
+cd ComfyUI/custom_nodes
+git clone https://github.com/CocyNoric/ComfyUI-ToriiGate-Reforged.git
+```
+
+## Model
+
+Put a ComfyUI-compatible ToriiGate `.safetensors` weight, such as `ToriiGate-0.5_int8_convrot.safetensors`, in:
+
+```text
+ComfyUI/models/clip/
+```
+
+In `Load CLIP` select:
+
+- `clip_name`: your ToriiGate weight
+- `type`: `stable_diffusion`
+- `device`: `default`
+
+## Usage and connections
+
+![Workflow connections](assets/show.png)
+
+You can drag [the example workflow](assets/ToriiGate%20Inferencer%20Reforged.json) into ComfyUI, or connect the nodes manually:
+
+```text
+Load CLIP.CLIP ────────────────> ToriiGate Caption Reforged.clip
+Load Image.IMAGE ──────────────> ToriiGate Caption Reforged.image
+Grounding Builder.prompt ──────> ToriiGate Caption Reforged.prompt (optional)
+ToriiGate Caption.caption ─────> Preview Any.source
+```
+
+For text-only generation, connect `Load CLIP.CLIP` to `ToriiGate Text Generate Reforged.clip`, then provide a prompt.
 
 ## Nodes
 
 ### ToriiGate Grounding Builder Reforged
 
-Builds the ToriiGate prompt template while preserving the existing Caption
-type, character names, general tags, per-character tags and descriptions. It
-does not load or inspect a model.
+Builds ToriiGate prompts and optional tags/character information.
+
+![ToriiGate Grounding Builder Reforged](assets/show_node2.png)
+
+#### Caption types
+
+`caption_type` controls the output format and detail level:
+
+| Mode | Output |
+| --- | --- |
+| `short` | Short caption covering the main subjects and details. |
+| `long` | Detailed natural-language caption in 2–5 paragraphs. |
+| `long_thoughts` | Structured character analysis, general description, individual parts, visible text, background and effects. |
+| `long_thoughts_v2` | Detailed character identification, key details, long description and per-character descriptions. |
+| `json` | JSON-style description of characters/main content, background, effects, text and atmosphere. |
+| `min_structured_md` | Shorter Markdown structure for key details, general content, characters and image effects. |
+| `min_structured_json` | Compact JSON-style general, character, effect, text and watermark fields. |
+| `json_comic` | Comic-focused JSON with frame descriptions, characters and overall meaning. |
+| `md_comic` | Comic-focused Markdown with layout and per-frame descriptions. |
+| `chroma-style` | Four views: regular summary, item list, Midjourney-style summary and commission description. |
 
 ### ToriiGate Caption Reforged
 
-Inputs are an `IMAGE`, a native `CLIP`/model, an optional prompt, pixel budget,
-generation length, temperature, top-p, top-k, decoding mode and seed. The node
-passes the image through the visual encoder already contained in the native
-ToriiGate/Qwen3.5 CLIP model, performs image-token insertion, ToriiGate chat
-templating and generation, then returns a `STRING` caption.
+Generates a caption from the connected CLIP model, image and optional grounding prompt.
 
-The original processor's `256 * 32 * 32` minimum pixel budget is preserved:
-for example, a 256x256 input is enlarged to 512x512 before native visual
-preprocessing. Images above the configured maximum are reduced as before.
-The node also locally compensates ComfyUI's current Qwen/VL normalization so
-the visual encoder receives ToriiGate's official `[0.5, 0.5, 0.5]` mean/std;
-other ComfyUI models are not affected.
-
-The node does not check model names, metadata, hashes or weight formats. If an
-incompatible model is connected, ComfyUI reports that its tokenizer did not
-accept the image or that the native generation interface is unavailable.
-
-`greedy_fast` is deterministic. `sample` uses temperature/top-p/top-k and the
-seed. Seed defaults to **42** and is fixed; seed `0` is a normal deterministic
-seed value rather than a special random sentinel. ComfyUI automatic progress
-feedback is used when its progress hook is available; there is no user
-progress toggle. Templated generation prefills ToriiGate's original empty
-`<think></think>` block so reasoning is disabled before decoding; removal of an
-occasional leading `<think>...</think>` block remains as a defensive fallback.
+![ToriiGate Caption Reforged](assets/show_node1.png)
 
 ### ToriiGate Text Generate Reforged
 
-Text-only generation using the exact same tokenizer, sampler and KV-cache loop
-as Caption. Inputs are the native model, `system_prompt`, `prompt`, generation
-controls and `template_mode` (`toriigate` or `raw`). ToriiGate is primarily an
-image-captioning model, so general chat quality is not guaranteed.
+Performs text-only generation with the connected CLIP model.
 
-## Memory and execution
+![ToriiGate Text Generate Reforged](assets/show_node3.png)
 
-The nodes never call `.to("cuda")`, move a model to CPU, empty CUDA caches,
-download weights, or retain a private model cache. They release local
-generation/KV-cache references after each execution and leave residency and
-offload decisions to ComfyUI's ModelPatcher. This lets a single loaded model
-be reused by Caption, Text Generate and downstream diffusion nodes.
+## Acknowledgements
 
-## Validation checklist
-
-The intended workflow should be checked with INT8ConvRot and BF16 image
-captioning, text-only generation, one model connected to both nodes, a Caption
-followed by diffusion (to exercise ComfyUI offload), repeated executions,
-missing-image errors, fixed-seed sampling and long generations that release
-their KV cache on completion.
+- Original ComfyUI extension: [litch230/comfyui_toriigate](https://github.com/litch230/comfyui_toriigate)
+- ToriiGate model, prompt formats and inference reference: [Minthy/ToriiGate-0.5](https://huggingface.co/Minthy/ToriiGate-0.5)

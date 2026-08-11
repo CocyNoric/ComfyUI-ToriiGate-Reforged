@@ -7,7 +7,9 @@ nodes only build ToriiGate prompts and run generation on the connected object.
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+import inspect
+import re
+from typing import Mapping
 
 from .generation import decode_tokens, generate_tokens, resolve_generation_model, resolve_tokenizer
 from .prompts import make_user_query, system_prompt as TORIIGATE_SYSTEM_PROMPT
@@ -175,76 +177,154 @@ class ToriiGateGroundingBuilder:
         ),)
 
 
-def _call_variants(function, variants):
-    """Call an adapter with a few deliberately small, compatible signatures."""
-    last_error = None
-    for args, kwargs in variants:
-        try:
-            return function(*args, **kwargs)
-        except (TypeError, AttributeError) as exc:
-            last_error = exc
-    if last_error is not None:
-        raise last_error
-    return None
+_TORIIGATE_MIN_IMAGE_PIXELS = 256 * 32 * 32
+_TORIIGATE_IMAGE_MEAN = (0.5, 0.5, 0.5)
+_TORIIGATE_IMAGE_STD = (0.5, 0.5, 0.5)
+# Current ComfyUI qwen_vl preprocessing defaults.  The local affine adapter
+# below makes its normalization produce the official ToriiGate values without
+# changing ComfyUI's global Qwen/VL behavior for other models.
+_COMFY_QWEN_IMAGE_MEAN = (0.48145466, 0.4578275, 0.40821073)
+_COMFY_QWEN_IMAGE_STD = (0.26862954, 0.26130258, 0.27577711)
 
 
-def _image_to_pil(image, max_pixels_mp):
-    try:
-        from PIL import Image
-    except ImportError as exc:
-        raise RuntimeError("ToriiGate Reforged Caption requires Pillow from the ComfyUI runtime.") from exc
+def _resize_comfy_image(image, max_pixels_mp):
+    """Return the first image within ToriiGate's original min/max pixel budget."""
     if image is None:
-        raise ValueError("ToriiGate Reforged Caption requires an IMAGE input.")
+        raise ValueError("ToriiGate Caption Reforged requires an IMAGE input.")
     try:
-        first = image[0]
-        array = first.detach().cpu().numpy() if hasattr(first, "detach") else first
-    except (IndexError, TypeError, AttributeError) as exc:
+        first = image[:1]
+        if int(first.shape[0]) < 1:
+            raise ValueError
+        height = int(first.shape[1])
+        width = int(first.shape[2])
+    except (IndexError, TypeError, AttributeError, ValueError) as exc:
         raise ValueError("IMAGE must be a ComfyUI image tensor with at least one image.") from exc
-    try:
-        import numpy as np
-        array = np.asarray(array)
-        if array.dtype.kind == "f":
-            array = (array * 255.0).clip(0, 255).astype(np.uint8)
-        else:
-            array = array.clip(0, 255).astype(np.uint8)
-    except ImportError as exc:
-        raise RuntimeError("ToriiGate Reforged Caption requires NumPy from the ComfyUI runtime.") from exc
-    pil = Image.fromarray(array)
-    if pil.mode != "RGB":
-        pil = pil.convert("RGB")
     limit = max(1, int(float(max_pixels_mp) * 1_000_000))
-    pixels = pil.width * pil.height
-    if pixels > limit:
-        scale = (limit / pixels) ** 0.5
-        pil = pil.resize((max(1, int(pil.width * scale)), max(1, int(pil.height * scale))), Image.Resampling.LANCZOS)
-    return pil
+    pixels = width * height
+    # The official processor uses min_pixels=256*32*32. Preserve that floor so
+    # a 256x256 input becomes 512x512 before native Qwen3.5 preprocessing.
+    # When a configured maximum is lower than the official minimum, the
+    # minimum wins, matching the original processor's final image budget.
+    target_pixels = max(_TORIIGATE_MIN_IMAGE_PIXELS, min(pixels, limit))
+    if pixels != target_pixels:
+        scale = (target_pixels / pixels) ** 0.5
+        target_height = max(1, int(height * scale))
+        target_width = max(1, int(width * scale))
+        try:
+            import torch.nn.functional as functional
+            channels_first = first.movedim(-1, 1)
+            try:
+                channels_first = functional.interpolate(
+                    channels_first,
+                    size=(target_height, target_width),
+                    mode="bicubic",
+                    align_corners=False,
+                    antialias=True,
+                )
+            except TypeError:
+                channels_first = functional.interpolate(
+                    channels_first,
+                    size=(target_height, target_width),
+                    mode="bicubic",
+                    align_corners=False,
+                )
+            first = channels_first.movedim(1, -1).clamp(0.0, 1.0)
+        except (ImportError, AttributeError, RuntimeError, TypeError) as exc:
+            raise RuntimeError("Could not resize the ComfyUI IMAGE tensor for ToriiGate captioning.") from exc
+    return first
+
+
+def _adapt_toriigate_image_preprocessing(image):
+    """Adapt raw IMAGE values to the official ToriiGate normalization.
+
+    ComfyUI's native Qwen visual path currently applies its CLIP mean/std
+    internally.  Transforming the raw tensor first makes that later step
+    mathematically equivalent to ``(pixel - 0.5) / 0.5`` for ToriiGate.
+    """
+    current_mean = image.new_tensor(_COMFY_QWEN_IMAGE_MEAN)
+    current_std = image.new_tensor(_COMFY_QWEN_IMAGE_STD)
+    official_mean = image.new_tensor(_TORIIGATE_IMAGE_MEAN)
+    official_std = image.new_tensor(_TORIIGATE_IMAGE_STD)
+    return (image - official_mean) / official_std * current_std + current_mean
+
+
+def _message_content_text(content):
+    if not isinstance(content, list):
+        return str(content or "")
+    pieces = []
+    for part in content:
+        if not isinstance(part, Mapping):
+            pieces.append(str(part))
+        elif part.get("type") == "image":
+            # ComfyUI's Qwen3.5 tokenizer replaces image_pad with an embedded
+            # image object supplied through clip.tokenize(..., image=image).
+            pieces.append("<|vision_start|><|image_pad|><|vision_end|>")
+        else:
+            pieces.append(str(part.get("text", "")))
+    return "".join(pieces)
 
 
 def _render_messages(tokenizer, messages):
     apply_template = getattr(tokenizer, "apply_chat_template", None) if tokenizer is not None else None
     if callable(apply_template):
-        try:
-            return apply_template(messages, tokenize=False, add_generation_prompt=True)
-        except (TypeError, ValueError):
-            # Text-only tokenizers may reject the multimodal content list.
-            text_messages = [
-                {"role": msg["role"], "content": " ".join(
-                    part.get("text", "") if isinstance(part, Mapping) else str(part)
-                    for part in (msg.get("content", []) if isinstance(msg.get("content"), list) else [msg.get("content", "")])
-                )}
-                for msg in messages
-            ]
-            return apply_template(text_messages, tokenize=False, add_generation_prompt=True)
+        # Prefer a tokenizer's own switch, but still normalize the rendered
+        # suffix below because not every template accepts or honors it.
+        for template_messages in (messages, [
+            {"role": msg["role"], "content": " ".join(
+                part.get("text", "") if isinstance(part, Mapping) else str(part)
+                for part in (msg.get("content", []) if isinstance(msg.get("content"), list) else [msg.get("content", "")])
+            )}
+            for msg in messages
+        ]):
+            for extra_options in ({"enable_thinking": False}, {}):
+                try:
+                    rendered = apply_template(
+                        template_messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        **extra_options,
+                    )
+                    return _ensure_thinking_disabled(rendered)
+                except (TypeError, ValueError):
+                    continue
+    # ToriiGate is based on Qwen3.5.  ComfyUI exposes its native tokenizer
+    # without apply_chat_template(), so render the equivalent ChatML directly.
     pieces = []
     for message in messages:
-        content = message.get("content", "")
-        if isinstance(content, list):
-            content = " ".join(
-                part.get("text", "<image>") if isinstance(part, Mapping) else str(part)
-                for part in content
-            )
-        pieces.append(f"{message.get('role', 'user')}: {content}")
-    return "\n".join(pieces) + "\nassistant:"
+        role = message.get("role", "user")
+        content = _message_content_text(message.get("content", ""))
+        pieces.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
+    pieces.append("<|im_start|>assistant\n")
+    return _ensure_thinking_disabled("".join(pieces))
+
+
+_TRAILING_OPEN_THINK = re.compile(r"<think(?:\s[^>]*)?>\s*\Z", re.IGNORECASE)
+_TRAILING_CLOSED_THINK = re.compile(r"</think>\s*\Z", re.IGNORECASE)
+_EMPTY_THINK_BLOCK = "<think>\n\n</think>\n"
+
+
+def _ensure_thinking_disabled(rendered):
+    """Prefill ToriiGate's empty reasoning block before generation starts."""
+    rendered = str(rendered or "")
+    if _TRAILING_CLOSED_THINK.search(rendered):
+        return rendered
+    open_think = _TRAILING_OPEN_THINK.search(rendered)
+    if open_think:
+        return rendered[:open_think.start()] + _EMPTY_THINK_BLOCK
+    return rendered + _EMPTY_THINK_BLOCK
+
+
+_LEADING_THINK_BLOCK = re.compile(r"\A\s*<think(?:\s[^>]*)?>.*?</think>\s*", re.IGNORECASE | re.DOTALL)
+
+
+def _clean_generated_text(text):
+    """Remove Qwen's private leading reasoning block from user-facing output."""
+    cleaned = str(text or "").strip()
+    while True:
+        updated = _LEADING_THINK_BLOCK.sub("", cleaned, count=1).lstrip()
+        if updated == cleaned:
+            return cleaned
+        cleaned = updated
 
 
 def _normalise_token_inputs(value):
@@ -267,7 +347,7 @@ def _tokenize(clip, text, messages, use_template=True):
         ):
             try:
                 return _normalise_token_inputs(tokenizer(rendered, **kwargs))
-            except (TypeError, ValueError, AttributeError):
+            except (TypeError, ValueError, AttributeError, RuntimeError):
                 continue
     for candidate in (clip, resolve_generation_model(clip)):
         tokenize = getattr(candidate, "tokenize", None)
@@ -275,7 +355,7 @@ def _tokenize(clip, text, messages, use_template=True):
             for args, kwargs in (((), {"text": rendered}), ((rendered,), {})):
                 try:
                     return _normalise_token_inputs(tokenize(*args, **kwargs))
-                except (TypeError, ValueError, AttributeError):
+                except (TypeError, ValueError, AttributeError, RuntimeError):
                     continue
     raise RuntimeError(
         "The connected CLIP/model has no usable tokenizer. "
@@ -283,130 +363,105 @@ def _tokenize(clip, text, messages, use_template=True):
     )
 
 
-def _vision_candidates(vision):
-    seen = set()
-    pending = [vision]
-    while pending:
-        candidate = pending.pop(0)
-        if candidate is None or id(candidate) in seen:
-            continue
-        seen.add(id(candidate))
-        yield candidate
-        for name in ("model", "vision_model", "clip_vision", "mmproj", "projector"):
-            child = getattr(candidate, name, None)
-            if child is not None and child is not candidate:
-                pending.append(child)
+def _supports_native_generation(clip):
+    return all(callable(getattr(clip, name, None)) for name in ("tokenize", "generate", "decode"))
 
 
-def _encode_vision(vision, image, source_image=None):
-    if vision is None:
+def _contains_image_token(value, seen=None):
+    if seen is None:
+        seen = set()
+    if value is None or id(value) in seen:
+        return False
+    seen.add(id(value))
+    if isinstance(value, Mapping):
+        if value.get("type") == "image":
+            return True
+        if any(key in value for key in ("pixel_values", "image_embeds", "image_embeddings")):
+            return True
+        return any(_contains_image_token(item, seen) for item in value.values())
+    if isinstance(value, (tuple, list)):
+        return any(_contains_image_token(item, seen) for item in value)
+    return False
+
+
+def _supported_kwargs(function, kwargs):
+    try:
+        signature = inspect.signature(function)
+    except (TypeError, ValueError):
+        return kwargs
+    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
+        return kwargs
+    return {key: value for key, value in kwargs.items() if key in signature.parameters}
+
+
+def _native_generate_text(clip, rendered, *, image=None, raw=False, max_new_tokens=512,
+                          temperature=0.5, top_p=1.0, top_k=0,
+                          decoding="greedy_fast", seed=42):
+    """Use ComfyUI's CLIP-native tokenizer/generator, including embedded images."""
+    if not _supports_native_generation(clip):
         raise RuntimeError(
-            "ToriiGate Reforged Caption requires a connected vision/mmproj input. "
-            "Load the compatible vision projector with ComfyUI and connect it to vision."
+            "The connected CLIP does not expose ComfyUI's native tokenize/generate/decode interface. "
+            "Load ToriiGate with a compatible native CLIP loader."
         )
-    if isinstance(vision, Mapping):
-        return dict(vision)
-    if hasattr(vision, "shape"):
-        return vision
-    prepared = None
-    for candidate in _vision_candidates(vision):
-        for name in ("image_processor", "processor", "preprocess"):
-            processor = getattr(candidate, name, None)
-            if callable(processor):
-                try:
-                    prepared = processor(images=image, return_tensors="pt")
-                except TypeError:
-                    try:
-                        prepared = processor(image)
-                    except (TypeError, ValueError):
-                        pass
-                if prepared is not None:
-                    break
-        if prepared is not None:
-            break
-    for candidate in _vision_candidates(vision):
-        for name in ("encode_image", "encode", "get_image_features", "forward"):
-            encoder = getattr(candidate, name, None)
-            if not callable(encoder):
-                continue
-            variants = []
-            if prepared is not None:
-                variants.extend([((prepared,), {}), ((), prepared if isinstance(prepared, Mapping) else {})])
-            if source_image is not None:
-                variants.append(((source_image,), {}))
-            variants.extend([((image,), {}), ((), {"image": image}), ((), {"images": image})])
-            try:
-                output = _call_variants(encoder, variants)
-            except (TypeError, AttributeError, ValueError):
-                continue
-            if output is not None:
-                return output
-    raise RuntimeError(
-        "The connected vision/mmproj object cannot encode images. "
-        "Connect a ToriiGate-compatible vision projector from ComfyUI's loader."
-    )
 
-
-def _prepare_multimodal_inputs(clip, vision, image, token_inputs, source_image=None):
-    image_features = _encode_vision(vision, image, source_image=source_image)
-    base = dict(token_inputs)
-    generation_model = resolve_generation_model(clip)
-    variants = []
-    extra = {
-        "input_ids": base.get("input_ids"),
-        "attention_mask": base.get("attention_mask"),
-        "image_embeds": image_features,
-        "image_embeddings": image_features,
-        "vision_embeddings": image_features,
-        "image": image,
-    }
-    for candidate in (clip, generation_model, vision):
-        for name in ("prepare_multimodal_inputs", "prepare_inputs_embeds", "build_multimodal_inputs", "insert_image_tokens", "encode_multimodal"):
-            adapter = getattr(candidate, name, None)
-            if not callable(adapter):
-                continue
-            variants.extend([
-                ((), extra),
-                ((base.get("input_ids"), image_features), {}),
-                ((base, image_features), {}),
-            ])
-            try:
-                result = _call_variants(adapter, variants)
-            except (TypeError, AttributeError, ValueError):
-                continue
-            if isinstance(result, Mapping):
-                merged = dict(result)
-                if "attention_mask" not in merged and base.get("attention_mask") is not None:
-                    merged["attention_mask"] = base["attention_mask"]
-                return merged
-            if result is not None:
-                return {"inputs_embeds": result, "attention_mask": base.get("attention_mask")}
-
-    # A loader may expose an embedding layer but no named adapter.  In that
-    # case prepend projected image features to text embeddings.  This is the
-    # generic representation consumed by the shared token loop; model-specific
-    # loaders can still provide a richer adapter above.
-    embedding_layer = getattr(generation_model, "get_input_embeddings", None)
-    if callable(embedding_layer) and base.get("input_ids") is not None and hasattr(image_features, "shape"):
+    tokenize = clip.tokenize
+    tokenizer_options = {"thinking": False}
+    if raw:
+        # ComfyUI's Qwen tokenizer otherwise applies its user/assistant
+        # template even when Text Generate is explicitly in raw mode.
+        tokenizer_options = {"llama_template": "{}", "thinking": True}
+    if image is None:
         try:
-            text_embeddings = embedding_layer(base["input_ids"])
-            if getattr(image_features, "ndim", 0) == 2:
-                image_features = image_features.unsqueeze(0)
-            import torch
-            inputs_embeds = torch.cat((image_features, text_embeddings), dim=1)
-            attention = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=inputs_embeds.device)
-            return {"inputs_embeds": inputs_embeds, "attention_mask": attention}
-        except (RuntimeError, TypeError, AttributeError):
-            pass
-
-    # Preserve projector-specific values for a model whose forward method
-    # accepts them directly.  This is still a standard model object contract;
-    # no model identity or weight format is inspected.
-    if isinstance(image_features, Mapping):
-        base.update(image_features)
+            tokens = tokenize(rendered, **tokenizer_options)
+        except TypeError:
+            tokens = tokenize(rendered)
     else:
-        base["image_embeds"] = image_features
-    return base
+        tokenization_errors = []
+        tokens = None
+        for image_kwargs in ({"image": image}, {"images": [image]}):
+            try:
+                tokens = tokenize(rendered, **image_kwargs, **tokenizer_options)
+                break
+            except TypeError as error:
+                tokenization_errors.append(error)
+                try:
+                    tokens = tokenize(rendered, **image_kwargs)
+                    break
+                except TypeError as fallback_error:
+                    tokenization_errors.append(fallback_error)
+        if tokens is None:
+            raise RuntimeError(
+                "The connected CLIP tokenizer cannot accept ComfyUI IMAGE data. "
+                "Load the ToriiGate/Qwen3.5 CLIP model with its native model type."
+            ) from tokenization_errors[-1]
+        if not _contains_image_token(tokens):
+            raise RuntimeError(
+                "The connected CLIP tokenizer ignored the IMAGE input. "
+                "Load a ToriiGate/Qwen3.5 CLIP model that includes its built-in visual encoder."
+            )
+
+    generate = clip.generate
+    kwargs = _supported_kwargs(generate, {
+        "do_sample": decoding == "sample" and float(temperature) > 0.0,
+        "max_length": int(max_new_tokens),
+        "temperature": float(temperature),
+        "top_p": float(top_p),
+        "top_k": int(top_k),
+        "min_p": 0.0,
+        "repetition_penalty": 1.0,
+        "presence_penalty": 0.0,
+        "seed": int(seed),
+    })
+    output = generate(tokens, **kwargs)
+    if hasattr(output, "tolist"):
+        output = output.tolist()
+    if isinstance(output, list) and len(output) == 1 and isinstance(output[0], list):
+        output = output[0]
+    try:
+        decoded = clip.decode(output, skip_special_tokens=True)
+    except TypeError:
+        decoded = clip.decode(output)
+    return _clean_generated_text(decoded)
 
 
 def _progress_callback(max_new_tokens):
@@ -428,35 +483,42 @@ def _progress_callback(max_new_tokens):
     return update
 
 
+def _token_sequence_length(value):
+    if value is None:
+        return 0
+    try:
+        return int(value.shape[1] if value.ndim > 1 else value.shape[0])
+    except (AttributeError, IndexError, TypeError):
+        pass
+    try:
+        first = value[0]
+        if isinstance(first, (list, tuple)):
+            return len(first)
+        return len(value)
+    except (IndexError, TypeError):
+        return 0
+
+
 def _decode_node_result(clip, output, input_ids):
-    prompt_length = 0
-    if input_ids is not None:
-        try:
-            prompt_length = int(input_ids.shape[1] if input_ids.ndim > 1 else input_ids.shape[0])
-        except (AttributeError, IndexError):
-            prompt_length = len(input_ids)
+    prompt_length = _token_sequence_length(input_ids)
     # Embedding-based multimodal adapters return generated ids without the
     # original text ids. Do not strip the generated sequence in that case.
-    try:
-        output_length = int(output.shape[1] if output.ndim > 1 else output.shape[0])
-        if output_length <= prompt_length:
-            prompt_length = 0
-    except (AttributeError, IndexError):
-        pass
-    return decode_tokens(clip, output, prompt_length=prompt_length)
+    output_length = _token_sequence_length(output)
+    if output_length <= prompt_length:
+        prompt_length = 0
+    return _clean_generated_text(decode_tokens(clip, output, prompt_length=prompt_length))
 
 
 class ToriiGateCaption:
-    """Caption one image with a connected ComfyUI CLIP + vision/mmproj."""
+    """Caption one image with a native ComfyUI ToriiGate CLIP model."""
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "image": ("IMAGE", {"tooltip": "Image to caption; only the first image in a batch is used."}),
                 "clip": ("CLIP", {"forceInput": True, "tooltip": "ToriiGate-compatible CLIP/model from a native ComfyUI loader. The node does not inspect its format or identity."}),
-                "vision": ("CLIP_VISION", {"forceInput": True, "tooltip": "Vision/mmproj from the compatible native loader. Required for image captioning."}),
-                "max_pixels_mp": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 8.0, "step": 0.1, "tooltip": "Resize budget in megapixels before the vision projector."}),
+                "image": ("IMAGE", {"tooltip": "Image to caption; only the first image in the batch is used."}),
+                "max_pixels_mp": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 8.0, "step": 0.1, "tooltip": "Maximum resize budget before the built-in visual encoder. ToriiGate's original ~0.262 MP minimum is preserved, so 256x256 is enlarged to 512x512."}),
                 "max_new_tokens": ("INT", {"default": 512, "min": 1, "max": 8192, "tooltip": "Maximum number of generated tokens."}),
                 "temperature": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 2.0, "step": 0.01, "tooltip": "Sampling temperature; used when decoding is sample."}),
                 "top_p": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Nucleus sampling threshold."}),
@@ -465,7 +527,7 @@ class ToriiGateCaption:
                 "seed": ("INT", {"default": 42, "min": 0, "max": 0xFFFFFFFFFFFFFFFF, "control_after_generate": "fixed", "tooltip": "Fixed seed for repeatable sampling. Randomization is controlled by ComfyUI's generation control."}),
             },
             "optional": {
-                "prompt": ("STRING", {"multiline": True, "default": "", "forceInput": True, "tooltip": "ToriiGate prompt; connect ToriiGate Reforged Grounding Builder or leave blank for a short default."}),
+                "prompt": ("STRING", {"multiline": True, "default": "", "forceInput": True, "tooltip": "ToriiGate prompt; connect ToriiGate Grounding Builder Reforged or leave blank for a short default."}),
             },
         }
 
@@ -474,14 +536,12 @@ class ToriiGateCaption:
     FUNCTION = "caption"
     CATEGORY = "ToriiGate"
 
-    def caption(self, image, clip, vision=None, max_pixels_mp=1.0, max_new_tokens=512,
+    def caption(self, clip, image, max_pixels_mp=1.0, max_new_tokens=512,
                 temperature=0.5, top_p=1.0, top_k=0, decoding="greedy_fast",
-                seed=42, prompt="", mmproj=None):
-        if vision is None:
-            vision = mmproj
-        if vision is None:
-            raise RuntimeError("ToriiGate Reforged Caption requires a vision/mmproj connection; the image projector is missing.")
-        pil = _image_to_pil(image, max_pixels_mp)
+                seed=42, prompt=""):
+        model_image = _adapt_toriigate_image_preprocessing(
+            _resize_comfy_image(image, max_pixels_mp)
+        )
         prompt = prompt.strip() if isinstance(prompt, str) else str(prompt or "")
         if not prompt:
             prompt = "Describe this image in detail."
@@ -489,22 +549,18 @@ class ToriiGateCaption:
             {"role": "system", "content": [{"type": "text", "text": TORIIGATE_SYSTEM_PROMPT}]},
             {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": prompt}]},
         ]
-        token_inputs = _tokenize(clip, prompt, messages)
-        multimodal = _prepare_multimodal_inputs(clip, vision, pil, token_inputs, source_image=image)
-        callback = _progress_callback(max_new_tokens)
-        output = generate_tokens(
+        rendered = _render_messages(resolve_tokenizer(clip), messages)
+        return (_native_generate_text(
             clip,
-            multimodal,
-            attention_mask=multimodal.get("attention_mask"),
-            max_new_tokens=int(max_new_tokens),
-            temperature=float(temperature),
-            top_p=float(top_p),
-            top_k=int(top_k),
-            seed=int(seed),
+            rendered,
+            image=model_image,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
             decoding=decoding,
-            progress_callback=callback,
-        )
-        return (_decode_node_result(clip, output, token_inputs.get("input_ids")),)
+            seed=seed,
+        ),)
 
 
 class ToriiGateTextGenerate:
@@ -546,6 +602,19 @@ class ToriiGateTextGenerate:
             if system_text:
                 messages.append({"role": "system", "content": system_text})
             messages.append({"role": "user", "content": prompt})
+        if _supports_native_generation(clip):
+            rendered = prompt if template_mode == "raw" else _render_messages(resolve_tokenizer(clip), messages)
+            return (_native_generate_text(
+                clip,
+                rendered,
+                raw=template_mode == "raw",
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                decoding=decoding,
+                seed=seed,
+            ),)
         token_inputs = _tokenize(clip, prompt, messages, use_template=template_mode != "raw")
         output = generate_tokens(
             clip,
@@ -562,9 +631,9 @@ class ToriiGateTextGenerate:
         return (_decode_node_result(clip, output, token_inputs.get("input_ids")),)
 
 
-NODE_KEY_GROUNDING_BUILDER = "ToriiGate_Reforged_GroundingBuilder"
-NODE_KEY_CAPTION = "ToriiGate_Reforged_Caption"
-NODE_KEY_TEXT_GENERATE = "ToriiGate_Reforged_TextGenerate"
+NODE_KEY_GROUNDING_BUILDER = "ToriiGate_GroundingBuilder_Reforged"
+NODE_KEY_CAPTION = "ToriiGate_Caption_Reforged"
+NODE_KEY_TEXT_GENERATE = "ToriiGate_TextGenerate_Reforged"
 
 # Keep one canonical key per node. Legacy keys are intentionally not aliases:
 # registering them would make old and new definitions collide in ComfyUI's
@@ -576,9 +645,9 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    NODE_KEY_GROUNDING_BUILDER: "ToriiGate Reforged Grounding Builder",
-    NODE_KEY_CAPTION: "ToriiGate Reforged Caption",
-    NODE_KEY_TEXT_GENERATE: "ToriiGate Reforged Text Generate",
+    NODE_KEY_GROUNDING_BUILDER: "ToriiGate Grounding Builder Reforged",
+    NODE_KEY_CAPTION: "ToriiGate Caption Reforged",
+    NODE_KEY_TEXT_GENERATE: "ToriiGate Text Generate Reforged",
 }
 
 if set(NODE_CLASS_MAPPINGS) != set(NODE_DISPLAY_NAME_MAPPINGS):

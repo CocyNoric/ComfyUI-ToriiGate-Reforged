@@ -334,6 +334,12 @@ def decode_tokens(model: Any, token_ids: Any, *, prompt_length: int = 0) -> str:
                 tokenizer = candidate
                 break
     generated = token_ids[:, int(prompt_length):] if getattr(token_ids, "ndim", 0) > 1 else token_ids[int(prompt_length):]
+    values = generated.tolist() if hasattr(generated, "tolist") else generated
+    if isinstance(values, tuple):
+        values = list(values)
+    is_batch = bool(isinstance(values, list) and values and isinstance(values[0], (list, tuple)))
+    batch_values = values if is_batch else [values]
+    single_values = values[0] if is_batch and len(values) == 1 else values
     if tokenizer is not None:
         for name in ("batch_decode", "decode"):
             decoder = getattr(tokenizer, name, None)
@@ -341,17 +347,27 @@ def decode_tokens(model: Any, token_ids: Any, *, prompt_length: int = 0) -> str:
                 continue
             try:
                 if name == "batch_decode":
-                    result = decoder(generated, skip_special_tokens=True)
+                    result = decoder(batch_values, skip_special_tokens=True)
                     return str(result[0] if isinstance(result, (list, tuple)) else result).strip()
-                return str(decoder(generated.tolist(), skip_special_tokens=True)).strip()
+                return str(decoder(single_values, skip_special_tokens=True)).strip()
             except TypeError:
                 try:
-                    return str(decoder(generated.tolist())).strip()
+                    retry_values = batch_values if name == "batch_decode" else single_values
+                    result = decoder(retry_values)
+                    return str(result[0] if name == "batch_decode" and isinstance(result, (list, tuple)) else result).strip()
                 except Exception:
                     continue
             except Exception:
                 continue
-    return " ".join(str(item) for item in generated.reshape(-1).tolist()).strip()
+
+    def flatten(items):
+        if isinstance(items, (list, tuple)):
+            for item in items:
+                yield from flatten(item)
+        else:
+            yield items
+
+    return " ".join(str(item) for item in flatten(values)).strip()
 
 
 __all__ = [

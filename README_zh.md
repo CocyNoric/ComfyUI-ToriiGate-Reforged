@@ -24,6 +24,13 @@ git clone https://github.com/CocyNoric/ComfyUI-ToriiGate-Reforged.git
 
 ## 模型放置与加载
 
+推荐从以下仓库下载模型（中国用户推荐使用 ModelScope）：
+
+- [Hugging Face：Ronysoc/ToriiGate-0.5-Int8-ConvRot](https://huggingface.co/Ronysoc/ToriiGate-0.5-Int8-ConvRot)
+- [ModelScope：CocyNoric/ToriiGate-0.5-Int8-ConvRot](https://modelscope.cn/models/CocyNoric/ToriiGate-0.5-Int8-ConvRot)（中国用户推荐）
+
+也可以从 [ToriiGate 原始仓库](https://huggingface.co/Minthy/ToriiGate-0.5)获取权重并进行合并。
+
 将 ComfyUI 兼容的 ToriiGate `.safetensors` 权重（例如 `ToriiGate-0.5_int8_convrot.safetensors`）放到：
 
 ```text

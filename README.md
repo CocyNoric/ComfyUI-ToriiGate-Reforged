@@ -24,6 +24,13 @@ git clone https://github.com/CocyNoric/ComfyUI-ToriiGate-Reforged.git
 
 ## Model
 
+Recommended model downloads:
+
+- [Hugging Face: Ronysoc/ToriiGate-0.5-Int8-ConvRot](https://huggingface.co/Ronysoc/ToriiGate-0.5-Int8-ConvRot)
+- [ModelScope: CocyNoric/ToriiGate-0.5-Int8-ConvRot](https://modelscope.cn/models/CocyNoric/ToriiGate-0.5-Int8-ConvRot) — recommended for users in China
+
+Alternatively, obtain and merge the weights from the [original ToriiGate repository](https://huggingface.co/Minthy/ToriiGate-0.5).
+
 Put a ComfyUI-compatible ToriiGate `.safetensors` weight, such as `ToriiGate-0.5_int8_convrot.safetensors`, in:
 
 ```text

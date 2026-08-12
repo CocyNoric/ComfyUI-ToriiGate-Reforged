@@ -105,3 +105,11 @@ Performs text-only generation with the connected CLIP model.
 
 - Original ComfyUI extension: [litch230/comfyui_toriigate](https://github.com/litch230/comfyui_toriigate)
 - ToriiGate model, prompt formats and inference reference: [Minthy/ToriiGate-0.5](https://huggingface.co/Minthy/ToriiGate-0.5)
+
+## License
+
+Original modifications and newly written code authored specifically for this repository are licensed under the [Apache License 2.0](LICENSES/Apache-2.0.txt).
+
+Portions derived from [litch230/comfyui_toriigate](https://github.com/litch230/comfyui_toriigate) are excluded from this license and remain copyright of their original author(s). The upstream project currently provides no explicit license, and no additional rights are granted for those portions by this repository.
+
+See [License Scope](LICENSE_SCOPE.md) for details.

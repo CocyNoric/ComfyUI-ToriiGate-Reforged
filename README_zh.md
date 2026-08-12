@@ -105,3 +105,11 @@ ToriiGate Caption.caption ─────> 预览任意 / Preview Any.source
 
 - 原始 ComfyUI 插件：[litch230/comfyui_toriigate](https://github.com/litch230/comfyui_toriigate)
 - ToriiGate 模型、提示词格式与推理参考：[Minthy/ToriiGate-0.5](https://huggingface.co/Minthy/ToriiGate-0.5)
+
+## 许可证
+
+本仓库中专门为此项目原创编写的新增代码与修改部分，采用 [Apache License 2.0](LICENSES/Apache-2.0.txt) 许可。
+
+派生自 [litch230/comfyui_toriigate](https://github.com/litch230/comfyui_toriigate) 的部分不包含在上述许可范围内，其版权仍归原作者所有。上游项目目前未提供明确的许可证，本仓库不对这些部分授予任何额外权利。
+
+详细说明参见[许可证适用范围](LICENSE_SCOPE.md)。

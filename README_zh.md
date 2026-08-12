@@ -1,5 +1,7 @@
 # ComfyUI-ToriiGate-Reforged
 
+> 一个基于 ToriiGate-0.5（Qwen3.5-4B 微调模型）的图像描述与文本生成 ComfyUI 节点包。
+
 [English](README.md)
 
 这是 [litch230/comfyui_toriigate](https://github.com/litch230/comfyui_toriigate) 的 Reforged 版本。新版删除了插件内置的 Transformers 模型加载器和 llama.cpp API 节点，改用 ComfyUI 原生 CLIP/Qwen3.5 完成模型加载、识图和生成。

@@ -1,5 +1,7 @@
 # ComfyUI-ToriiGate-Reforged
 
+> A ComfyUI custom node pack for image captioning and text generation with ToriiGate-0.5, a fine-tuned Qwen3.5-4B model.
+
 [中文说明](README_zh.md)
 
 This is a Reforged version of [litch230/comfyui_toriigate](https://github.com/litch230/comfyui_toriigate). It removes the bundled Transformers loader and llama.cpp API nodes, and uses ComfyUI's native CLIP/Qwen3.5 loading, image understanding and generation instead.

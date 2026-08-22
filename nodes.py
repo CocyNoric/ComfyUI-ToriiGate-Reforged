@@ -8,6 +8,7 @@ nodes only build ToriiGate prompts and run generation on the connected object.
 from __future__ import annotations
 
 import inspect
+import math
 import re
 from typing import Mapping
 
@@ -178,6 +179,7 @@ class ToriiGateGroundingBuilder:
 
 
 _TORIIGATE_MIN_IMAGE_PIXELS = 256 * 32 * 32
+_TORIIGATE_IMAGE_FACTOR = 32
 _TORIIGATE_IMAGE_MEAN = (0.5, 0.5, 0.5)
 _TORIIGATE_IMAGE_STD = (0.5, 0.5, 0.5)
 # Current ComfyUI qwen_vl preprocessing defaults.  The local affine adapter
@@ -187,8 +189,27 @@ _COMFY_QWEN_IMAGE_MEAN = (0.48145466, 0.4578275, 0.40821073)
 _COMFY_QWEN_IMAGE_STD = (0.26862954, 0.26130258, 0.27577711)
 
 
+def _toriigate_image_dimensions(height, width, max_pixels):
+    """Return ToriiGate dimensions aligned to the visual encoder's 32px grid."""
+    factor = _TORIIGATE_IMAGE_FACTOR
+    min_pixels = _TORIIGATE_MIN_IMAGE_PIXELS
+    max_pixels = max(min_pixels, int(max_pixels))
+    target_height = round(height / factor) * factor
+    target_width = round(width / factor) * factor
+    target_pixels = target_height * target_width
+    if target_pixels > max_pixels:
+        scale = math.sqrt((height * width) / max_pixels)
+        target_height = max(factor, math.floor(height / scale / factor) * factor)
+        target_width = max(factor, math.floor(width / scale / factor) * factor)
+    elif target_pixels < min_pixels:
+        scale = math.sqrt(min_pixels / (height * width))
+        target_height = math.ceil(height * scale / factor) * factor
+        target_width = math.ceil(width * scale / factor) * factor
+    return target_height, target_width
+
+
 def _resize_comfy_image(image, max_pixels_mp):
-    """Return the first image within ToriiGate's original min/max pixel budget."""
+    """Return the first image at ToriiGate's final visual-encoder dimensions."""
     if image is None:
         raise ValueError("ToriiGate Caption Reforged requires an IMAGE input.")
     try:
@@ -197,19 +218,16 @@ def _resize_comfy_image(image, max_pixels_mp):
             raise ValueError
         height = int(first.shape[1])
         width = int(first.shape[2])
+        if height < 1 or width < 1:
+            raise ValueError
     except (IndexError, TypeError, AttributeError, ValueError) as exc:
         raise ValueError("IMAGE must be a ComfyUI image tensor with at least one image.") from exc
     limit = max(1, int(float(max_pixels_mp) * 1_000_000))
-    pixels = width * height
-    # The official processor uses min_pixels=256*32*32. Preserve that floor so
-    # a 256x256 input becomes 512x512 before native Qwen3.5 preprocessing.
-    # When a configured maximum is lower than the official minimum, the
-    # minimum wins, matching the original processor's final image budget.
-    target_pixels = max(_TORIIGATE_MIN_IMAGE_PIXELS, min(pixels, limit))
-    if pixels != target_pixels:
-        scale = (target_pixels / pixels) ** 0.5
-        target_height = max(1, int(height * scale))
-        target_width = max(1, int(width * scale))
+    # Match Qwen's smart-resize grid here because ComfyUI's built-in Qwen3.5
+    # processor uses a lower generic minimum and cannot enforce ToriiGate's
+    # original 256*32*32 floor after its own 32-pixel rounding.
+    target_height, target_width = _toriigate_image_dimensions(height, width, limit)
+    if (height, width) != (target_height, target_width):
         try:
             import torch.nn.functional as functional
             channels_first = first.movedim(-1, 1)
